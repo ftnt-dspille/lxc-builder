@@ -18,7 +18,7 @@ nano .env  # Edit with your SSH settings
 
 This will create a ready-to-use LXC image with SSH access in the `./out/` directory.
 
-## 🔐 SSH Configuration
+## SSH Configuration
 
 ### Using Environment Variables (.env file) - Recommended
 
@@ -55,7 +55,7 @@ SSH_KEY_FILE=/path/to/your/public/key.pub
 3. **Set strong passwords** if using password authentication
 4. **Disable root login** in production (handled automatically when using keys only)
 
-## 📋 Requirements
+## Requirements
 
 | Platform    | Requirements                                    |
 | ----------- | ----------------------------------------------- |
@@ -63,7 +63,7 @@ SSH_KEY_FILE=/path/to/your/public/key.pub
 | **macOS**   | Docker Desktop                                  |
 | **Linux**   | Docker Engine with privileged container support |
 
-## 🛠️ Installation & Setup
+## Installation & Setup
 
 ### Windows
 
@@ -120,7 +120,7 @@ SSH_KEY_FILE=/path/to/your/public/key.pub
    ./build-lxc-wrapper.sh alpine 3.19
    ```
 
-## 🧪 Supported Distributions
+## Supported Distributions
 
 | Distribution    | Supported Releases          | Default Release |
 | --------------- | --------------------------- | --------------- |
@@ -133,7 +133,7 @@ SSH_KEY_FILE=/path/to/your/public/key.pub
 | **Alpine**      | 3.17, 3.18, 3.19, edge      | 3.19            |
 | **Arch Linux**  | current                     | current         |
 
-## 🎯 Usage Examples
+## Usage Examples
 
 ### Basic Usage with SSH
 
@@ -284,19 +284,19 @@ ssh admin@$(sudo lxc-info -n mycontainer -iH)
 sudo lxc-attach -n mycontainer
 ```
 
-## 🗂️ What's Included
+## What's Included
 
 Each generated LXC image includes:
 
-- ✅ **SSH Server** - Pre-configured and ready for remote access
-- ✅ **SSH User** - With password and/or key authentication (if configured)
-- ✅ **Python 3** - For scripting and development
-- ✅ **sudo** - Administrative access control for SSH user
-- ✅ **Base system** - Minimal but functional OS
-- ✅ **Working DNS** - Internet connectivity configured
-- ✅ **Service management** - SystemD/OpenRC depending on distro
+- **SSH Server** - Pre-configured and ready for remote access
+- **SSH User** - With password and/or key authentication (if configured)
+- **Python 3** - For scripting and development
+- **sudo** - Administrative access control for SSH user
+- **Base system** - Minimal but functional OS
+- **Working DNS** - Internet connectivity configured
+- **Service management** - SystemD/OpenRC depending on distro
 
-## 🔐 Security Features
+## Security Features
 
 ### Automatic SSH Configuration
 
@@ -318,7 +318,7 @@ When using only SSH keys (no passwords set):
 ./build-lxc-wrapper.sh --ssh-user admin --ssh-key-file ~/.ssh/id_rsa.pub
 ```
 
-## 🛠️ Troubleshooting
+## ️ Troubleshooting
 
 ### Common Issues
 
@@ -367,7 +367,7 @@ rm -rf ./lxc-cache/*
 ssh-keygen -l -f /path/to/your/key.pub
 ```
 
-## 🔒 Security Considerations
+## Security Considerations
 
 ### Default Security Settings
 
