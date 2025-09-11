@@ -5,7 +5,7 @@
 # customizes the root filesystem in a chroot, and packages the result as a zip file
 # with LXC configuration files for easy deployment.
 #
-# Supported distributions: debian, ubuntu, fedora, centos, rocky, almalinux, alpine, arch
+# Supported distributions: debian, ubuntu, fedora, centos, rockylinux, almalinux, alpine, arch
 #
 # Steps:
 # 1. Fetch or cache the base LXC image.
@@ -35,7 +35,7 @@ Build customized LXC container images with SSH, Python, and sudo preinstalled.
 OPTIONS:
     -h, --help          Show this help message
     -d, --dist DIST     Distribution (default: debian)
-                        Supported: debian, ubuntu, fedora, centos, rocky, almalinux, alpine, arch
+                        Supported: debian, ubuntu, fedora, centos, rockylinux, almalinux, alpine, arch
     -r, --release REL   Release/version (default: trixie for debian)
     -a, --arch ARCH     Architecture (default: amd64)
     -v, --variant VAR   Variant (default: cloud)
@@ -74,7 +74,7 @@ SUPPORTED DISTRIBUTIONS:
     ubuntu      - Releases: focal, jammy, noble, mantic
     fedora      - Releases: 38, 39, 40
     centos      - Releases: 8, 9
-    rocky       - Releases: 8, 9
+    rockylinux       - Releases: 8, 9
     almalinux   - Releases: 8, 9
     alpine      - Releases: 3.17, 3.18, 3.19, edge
     arch        - Releases: current
@@ -167,7 +167,7 @@ if [[ -z "$RELEASE" ]]; then
         debian) RELEASE="trixie" ;;
         ubuntu) RELEASE="jammy" ;;
         fedora) RELEASE="39" ;;
-        centos|rocky|almalinux) RELEASE="9" ;;
+        centos|rockylinux|almalinux) RELEASE="9" ;;
         alpine) RELEASE="3.19" ;;
         arch) RELEASE="current" ;;
         *)
@@ -182,11 +182,11 @@ fi
 
 # Validate distribution
 case "$DIST" in
-    debian|ubuntu|fedora|centos|rocky|almalinux|alpine|arch)
+    debian|ubuntu|fedora|centos|rockylinux|almalinux|alpine|arch)
         ;;
     *)
         echo "Error: Unsupported distribution '$DIST'"
-        echo "Supported: debian, ubuntu, fedora, centos, rocky, almalinux, alpine, arch"
+        echo "Supported: debian, ubuntu, fedora, centos, rockylinux, almalinux, alpine, arch"
         exit 1
         ;;
 esac
@@ -217,7 +217,7 @@ get_package_config() {
             PACKAGES="openssh-server python3 sudo"
             SSH_SERVICE_ENABLE="systemctl enable sshd"
             ;;
-        centos|rocky|almalinux)
+        centos|rockylinux|almalinux)
             PKG_UPDATE="dnf makecache"
             PKG_INSTALL="dnf install -y"
             PACKAGES="openssh-server python3 sudo"

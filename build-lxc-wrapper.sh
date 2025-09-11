@@ -26,7 +26,7 @@ Docker wrapper for building customized LXC container images.
 
 POSITIONAL ARGUMENTS:
     DIST        Distribution (default: debian)
-                Supported: debian, ubuntu, fedora, centos, rocky, almalinux, alpine, arch
+                Supported: debian, ubuntu, fedora, centos, rockylinux, almalinux, alpine, arch
     RELEASE     Release/version (auto-detected if not specified)
     ARCH        Architecture (default: amd64)
     VARIANT     Variant (default: cloud)
@@ -64,7 +64,7 @@ SUPPORTED DISTRIBUTIONS:
     ubuntu      - Releases: focal, jammy, noble, mantic
     fedora      - Releases: 38, 39, 40
     centos      - Releases: 8, 9
-    rocky       - Releases: 8, 9
+    rockylinux       - Releases: 8, 9
     almalinux   - Releases: 8, 9
     alpine      - Releases: 3.17, 3.18, 3.19, edge
     arch        - Releases: current
@@ -181,11 +181,11 @@ fi
 
 # Validate distribution
 case "$DIST" in
-    debian|ubuntu|fedora|centos|rocky|almalinux|alpine|arch)
+    debian|ubuntu|fedora|centos|rockylinux|almalinux|alpine|arch)
         ;;
     *)
         echo "❌ Error: Unsupported distribution '$DIST'"
-        echo "Supported: debian, ubuntu, fedora, centos, rocky, almalinux, alpine, arch"
+        echo "Supported: debian, ubuntu, fedora, centos, rockylinux, almalinux, alpine, arch"
         exit 1
         ;;
 esac
