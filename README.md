@@ -443,6 +443,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/lxc-image-builder/issues)
+- **Issues**: [GitHub Issues](https://github.com/ftnt-dspille/lxc-builder/issues)
 - **Documentation**: This README and `--help` commands
-- **Security**: For security issues, please use private disclosure
