@@ -1,0 +1,55 @@
+# LXC Image Builder - Git Ignore File
+# Add this to your .gitignore to keep sensitive files out of version control
+
+# Environment configuration (contains passwords and sensitive data)
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+out/
+*.zip
+
+# Cache directories
+lxc-cache/
+cache/
+.cache/
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# SSH keys (if storing them in project directory)
+*.pub
+*.pem
+id_*
+*.key
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Log files
+*.log
+logs/
+
+# Docker build context (if you don't want to include certain files)
+.dockerignore
+
+# Backup files
+*.backup
+*.bak
+*.orig
