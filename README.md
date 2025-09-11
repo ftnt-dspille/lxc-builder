@@ -437,7 +437,7 @@ When contributing:
 3. Test SSH configurations with different authentication methods
 4. Ensure backwards compatibility with existing configurations
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
