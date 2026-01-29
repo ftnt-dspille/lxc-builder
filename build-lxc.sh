@@ -208,7 +208,7 @@ get_package_config() {
         debian|ubuntu)
             PKG_UPDATE="apt-get update"
             PKG_INSTALL="apt-get install -y"
-            PACKAGES="dhcpcd-base ifupdown openssh-server python3 sudo"
+            PACKAGES="dhcpcd-base ifupdown openssh-server python3 sudo sshpass"
             SSH_SERVICE_ENABLE=""  # Enabled by default
             ;;
         fedora)
