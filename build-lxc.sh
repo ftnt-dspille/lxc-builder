@@ -707,11 +707,16 @@ if [[ -n "$FABRIC_PAYLOAD" ]]; then
     cp -a "$FABRIC_PAYLOAD/." "$ROOT/fabric/"
     [[ -f "$ROOT/fabric/init" ]] && chmod +x "$ROOT/fabric/init"
     [[ -d "$ROOT/fabric/setup.d" ]] && chmod +x "$ROOT"/fabric/setup.d/* 2>/dev/null || true
+    # IMPORTANT: do NOT order on network-online.target — a minimal-EL LXC never
+    # reaches it (no NetworkManager/networkd-wait-online; the IP is raised by the
+    # fsh-netcfg shim), so a unit that Wants/After=network-online.target never
+    # fires. Order after the netcfg shim + docker instead, and don't hard-require
+    # docker (10-docker-up starts it). multi-user.target pulls us in at boot.
     cat > "$ROOT/etc/systemd/system/fabric-init.service" <<'EOF'
 [Unit]
 Description=Fabric first-boot app bring-up (/fabric/init -> setup.d/*)
-After=network-online.target docker.service
-Wants=network-online.target
+After=fsh-netcfg.service docker.service network.target
+Wants=fsh-netcfg.service
 
 [Service]
 Type=oneshot
