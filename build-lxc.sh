@@ -100,6 +100,10 @@ while [[ $# -gt 0 ]]; do
             RELEASE="$2"
             shift 2
             ;;
+        --releasever)
+            RELEASEVER="$2"
+            shift 2
+            ;;
         -a|--arch)
             ARCH="$2"
             shift 2
@@ -151,6 +155,11 @@ done
 # Default values (can be overridden by environment or command line)
 : "${DIST:=debian}"
 : "${RELEASE:=}"
+# Optional exact point-release to pin a dnf-based distro to (e.g. 9.6, 9.7).
+# The base image is still fetched at major --release (linuxcontainers only
+# serves majors for Rocky/Alma); RELEASEVER then `distro-sync`s to the exact
+# minor against the vault repos. Leave empty to track the latest minor.
+: "${RELEASEVER:=}"
 : "${ARCH:=amd64}"
 : "${VARIANT:=cloud}"
 : "${NAME:=tmp-image}"
@@ -160,6 +169,11 @@ done
 : "${SSH_PASSWORD:=}"
 : "${SSH_KEY_FILE:=}"
 : "${ROOT_PASSWORD:=}"
+# Bake-in hooks (wrapper mounts these into the container):
+#   PROVISION_SCRIPT — script run in-chroot at build time (e.g. install Docker)
+#   FABRIC_PAYLOAD   — dir copied into the rootfs at /fabric (init + setup.d/)
+: "${PROVISION_SCRIPT:=}"
+: "${FABRIC_PAYLOAD:=}"
 
 # Set default releases if not specified
 if [[ -z "$RELEASE" ]]; then
@@ -178,7 +192,9 @@ if [[ -z "$RELEASE" ]]; then
     esac
 fi
 
-: "${ZIP_BASENAME:=LXC_${DIST}_${RELEASE}_toolbox_${ARCH}}"
+# Label used in the output zip name: the pinned minor when set, else the major.
+RELEASE_LABEL="${RELEASEVER:-$RELEASE}"
+: "${ZIP_BASENAME:=LXC_${DIST}_${RELEASE_LABEL}_toolbox_${ARCH}}"
 
 # Validate distribution
 case "$DIST" in
@@ -318,6 +334,125 @@ chroot "$ROOT" $CHROOT_SHELL -c "
     printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 "
 
+# Behind an SSL-inspecting proxy (e.g. corporate/Fortinet MITM), dnf rejects
+# the self-signed CA in the chain. INSECURE_TLS=1 disables dnf cert checking
+# in the image's dnf.conf so distro-sync, package install, and later Ansible
+# dnf calls all work. Lab-only convenience; leave unset for trusted networks.
+if [[ "${INSECURE_TLS:-0}" == "1" ]]; then
+    case "$DIST" in
+        centos|rockylinux|almalinux|fedora)
+            echo "INSECURE_TLS=1 -> setting sslverify=False in dnf.conf"
+            chroot "$ROOT" $CHROOT_SHELL -c "
+                grep -q '^sslverify' /etc/dnf/dnf.conf 2>/dev/null \
+                  && sed -i 's/^sslverify.*/sslverify=False/' /etc/dnf/dnf.conf \
+                  || echo 'sslverify=False' >> /etc/dnf/dnf.conf
+            "
+            ;;
+    esac
+fi
+
+# Persistent dnf package cache (optimization). The wrapper bind-mounts a host
+# cache dir at /dnf-cache; map it into the chroot's /var/cache/dnf and tell dnf
+# to keep downloaded rpms. distro-sync + package install (the build's biggest
+# cost, run under qemu emulation) then reuse rpms across rebuilds instead of
+# re-downloading. The mount is removed before packaging so it never lands in the
+# image; pair this with `dnf clean metadata` (NOT `clean all`) below to preserve
+# the package cache.
+DNF_CACHE_MOUNTED=0
+case "$DIST" in
+    centos|rockylinux|almalinux|fedora)
+        chroot "$ROOT" $CHROOT_SHELL -c "
+            grep -q '^keepcache' /etc/dnf/dnf.conf 2>/dev/null \
+              && sed -i 's/^keepcache.*/keepcache=1/' /etc/dnf/dnf.conf \
+              || echo 'keepcache=1' >> /etc/dnf/dnf.conf
+        "
+        if [[ -d /dnf-cache ]]; then
+            mkdir -p "$ROOT/var/cache/dnf"
+            if mount --bind /dnf-cache "$ROOT/var/cache/dnf"; then
+                DNF_CACHE_MOUNTED=1
+                echo "dnf package cache: persisting via /dnf-cache bind mount"
+            fi
+        fi
+        ;;
+esac
+
+# Pin the exact point release (dnf-based distros only) BEFORE installing
+# packages, so everything that follows resolves against the pinned minor.
+if [[ -n "$RELEASEVER" ]]; then
+    case "$DIST" in
+        rockylinux)
+            # Only the CURRENT minor is on the live mirror network; archived
+            # minors (and reliably ALL minors) live in the vault. Disable the
+            # stock mirrorlist repos and write a clean vault-pinned repo file —
+            # robust whether $RELEASEVER is current or archived. (Writing the
+            # file from the host side avoids chroot double-shell $var expansion.)
+            echo "Pinning rockylinux to $RELEASEVER via vault repos + distro-sync..."
+            VAULT_BASE="https://dl.rockylinux.org/vault/rocky/$RELEASEVER"
+            for f in "$ROOT"/etc/yum.repos.d/*.repo; do
+                [[ -e "$f" ]] && mv "$f" "$f.disabled"
+            done
+            cat > "$ROOT/etc/yum.repos.d/vault.repo" <<EOF
+[baseos]
+name=Rocky Linux $RELEASEVER - BaseOS (vault)
+baseurl=$VAULT_BASE/BaseOS/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+
+[appstream]
+name=Rocky Linux $RELEASEVER - AppStream (vault)
+baseurl=$VAULT_BASE/AppStream/\$basearch/os/
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+
+[crb]
+name=Rocky Linux $RELEASEVER - CRB (vault)
+baseurl=$VAULT_BASE/CRB/\$basearch/os/
+gpgcheck=1
+enabled=0
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+EOF
+            chroot "$ROOT" $CHROOT_SHELL -c "
+                set -e
+                echo '$RELEASEVER' > /etc/dnf/vars/releasever
+                dnf clean metadata
+                # The linuxcontainers base tracks the LATEST minor, so pinning
+                # to an earlier one is a downgrade. fips provider pkgs pin exact
+                # openssl-libs and block distro-sync; drop them, then sync with
+                # --nobest --allowerasing to push the downgrade through.
+                rpm -e --nodeps openssl-fips-provider openssl-fips-provider-so 2>/dev/null || true
+                dnf -y --releasever='$RELEASEVER' --nobest --allowerasing distro-sync
+                # distro-sync reinstalls rocky-repos, which restores the stock
+                # mirrorlist repo files (404 for archived minors). Remove them so
+                # only vault.repo remains for the package-install step that follows.
+                rm -f /etc/yum.repos.d/rocky*.repo /etc/yum.repos.d/*.repo.disabled
+                dnf clean metadata
+                echo 'Pinned release:'; cat /etc/rocky-release || true
+            "
+            ;;
+        almalinux)
+            echo "Pinning almalinux to $RELEASEVER via distro-sync..."
+            chroot "$ROOT" $CHROOT_SHELL -c "
+                set -e
+                echo '$RELEASEVER' > /etc/dnf/vars/releasever
+                dnf -y --releasever='$RELEASEVER' distro-sync
+            "
+            ;;
+        fedora)
+            echo "Pinning fedora to $RELEASEVER via distro-sync..."
+            chroot "$ROOT" $CHROOT_SHELL -c "
+                set -e
+                dnf -y --releasever='$RELEASEVER' distro-sync
+                echo '$RELEASEVER' > /etc/dnf/vars/releasever
+            "
+            ;;
+        *)
+            echo "Warning: --releasever ignored for non-dnf distro '$DIST'"
+            ;;
+    esac
+fi
+
 # Install packages based on distribution
 echo "Installing packages: $PACKAGES"
 chroot "$ROOT" $CHROOT_SHELL -c "
@@ -356,6 +491,15 @@ if [[ -n "$SSH_USER" ]]; then
         mkdir -p /home/'$SSH_USER'/.ssh
         chmod 700 /home/'$SSH_USER'/.ssh
         chown '$SSH_USER':'$SSH_USER' /home/'$SSH_USER'/.ssh
+
+        # Passwordless sudo for the admin user. This is a key-only lab toolbox
+        # image with no user password, so wheel/sudo membership alone leaves
+        # sudo unusable non-interactively ('a password is required'). Any
+        # automation that escalates over key SSH (e.g. tools/fs_soar_install.py)
+        # needs NOPASSWD. Drop-in file so it survives package updates.
+        mkdir -p /etc/sudoers.d
+        echo '$SSH_USER ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-'$SSH_USER'-nopasswd
+        chmod 440 /etc/sudoers.d/90-'$SSH_USER'-nopasswd
     "
 
     # Set user password if specified
@@ -387,8 +531,11 @@ chroot "$ROOT" $CHROOT_SHELL -c "
     sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
     sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config || true
 
-    # If no password authentication is desired and we have keys, disable passwords
-    if [[ -n '$SSH_KEY_FILE' && -z '$SSH_PASSWORD' && -z '$ROOT_PASSWORD' ]]; then
+    # Key provided and no SSH *user* password -> SSH is key-only. ROOT_PASSWORD
+    # is intentionally NOT part of this condition: it's a CONSOLE/recovery
+    # credential (getty), and PermitRootLogin no still blocks root over SSH, so
+    # SSH stays key-only even with a root password set for serial-console debug.
+    if [[ -n '$SSH_KEY_FILE' && -z '$SSH_PASSWORD' ]]; then
         sed -i 's/PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config || true
         sed -i 's/PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config || true
     fi
@@ -413,18 +560,201 @@ case "$DIST" in
             pacman-key --populate || true
         "
         ;;
+    centos|rockylinux|almalinux|fedora)
+        # EL minimal LXC networking. ROOT CAUSE (confirmed live, 2026-06-09):
+        # Fabric Studio does NOT serve DHCP for a port — it auto-assigns a STATIC
+        # address in its model and injects it into the guest by writing Debian
+        # ifupdown config straight into the rootfs: /etc/network/interfaces +
+        # /etc/network/interfaces.d/ethN.conf with `iface ethN inet static /
+        # address / netmask`. The known-good debian-trixie toolbox comes up
+        # because it ships ifupdown and consumes those files. Rocky/RHEL ships
+        # NEITHER systemd-networkd NOR an ifupdown package NOR the NM ifupdown
+        # plugin (RH's NetworkManager has only ifcfg-rh + keyfile), so FS's
+        # injected config is ignored and eth0 never gets an address.
+        #
+        # Fix: a tiny oneshot that parses FS's interfaces.d/*.conf and applies it
+        # via iproute2 — no package deps, works on minimal EL. NM stays disabled
+        # so it can't fight the shim; the stale dhcp ifcfg-eth0 is removed.
+        echo "Configuring EL networking (FS ifupdown-config shim)..."
+        chroot "$ROOT" $CHROOT_SHELL -c "
+            $PKG_INSTALL iproute 2>/dev/null || true
+            systemctl disable NetworkManager 2>/dev/null || true
+            rm -f /etc/sysconfig/network-scripts/ifcfg-eth0
+        "
+        cat > "$ROOT/usr/local/sbin/fsh-netcfg.sh" <<'EOF'
+#!/bin/sh
+# Apply Fabric Studio-injected ifupdown config (/etc/network/interfaces.d/*.conf)
+# on minimal EL, where ifupdown / NM-ifupdown are unavailable. FS writes per-port
+# `iface ethN inet {static|manual|dhcp}` with address/netmask (+optional gateway).
+#
+# WHY A SCRIPT, NOT A NATIVE CONSUMER: FS writes Debian ifupdown-format files.
+# EL ships nothing that reads /etc/network/interfaces.d — no ifupdown package, no
+# NM-ifupdown plugin (NM has only ifcfg-rh/keyfile), and network-scripts reads
+# ifcfg, not interfaces.d. The known-good debian-trixie toolbox consumes them via
+# ifupdown's `networking.service` (`ifup -a`) at boot. NOTE: udev does NOT run in
+# these LXC containers (systemd-udevd inactive, no /run/udev — host owns devices),
+# so trixie's 80-ifupdown.rules never fires; its eth0 is raised by boot-time
+# `ifup -a`. So this is a boot-time oneshot too.
+#
+# RACE (confirmed live 2026-06-09): a single early `ip link set up` does NOT stick
+# — FS attaches the container veth around boot and the port ends admin-DOWN *after*
+# the oneshot exits, even though the address we add persists. Once eth0 is genuinely
+# UP nothing re-lowers it. trixie escapes this because networking.service is ordered
+# late (After local-fs/modules-load/ifupdown-pre) so the veth has settled. We can't
+# rely on udev, so we instead: (1) wait for each device to appear, (2) apply
+# addr/route, (3) re-assert `link up` over a short settle window so a post-attach FS
+# toggle still ends UP.
+set -u
+
+mask2prefix() {
+    p=0; oldifs="$IFS"; IFS=.
+    for o in $1; do
+        case "$o" in
+            255) p=$((p+8));; 254) p=$((p+7));; 252) p=$((p+6));; 248) p=$((p+5));;
+            240) p=$((p+4));; 224) p=$((p+3));; 192) p=$((p+2));; 128) p=$((p+1));;
+            *) ;;
+        esac
+    done
+    IFS="$oldifs"; echo "$p"
+}
+
+is_up() { ip link show dev "$1" 2>/dev/null | grep -q "state UP"; }
+
+managed=""
+for f in /etc/network/interfaces.d/*.conf; do
+    [ -f "$f" ] || continue
+    iface=""; method=""; addr=""; mask=""; gw=""
+    while read -r key val rest; do
+        case "$key" in
+            iface)   iface="$val"; method="$rest" ;;
+            address) addr="$val" ;;
+            netmask) mask="$val" ;;
+            gateway) gw="$val" ;;
+        esac
+    done < "$f"
+    [ -n "$iface" ] || continue
+
+    # Wait up to ~15s for FS to attach the device before configuring it.
+    i=0
+    while [ $i -lt 30 ] && ! ip link show dev "$iface" >/dev/null 2>&1; do
+        i=$((i+1)); sleep 0.5
+    done
+    ip link show dev "$iface" >/dev/null 2>&1 || continue
+
+    ip link set "$iface" up 2>/dev/null || true
+    managed="$managed $iface"
+    case "$method" in
+        *static*)
+            [ -n "$addr" ] || continue
+            pfx=24; [ -n "$mask" ] && pfx=$(mask2prefix "$mask")
+            ip addr show dev "$iface" | grep -q "inet $addr/" \
+                || ip addr add "$addr/$pfx" dev "$iface"
+            [ -n "$gw" ] && ip route replace default via "$gw" dev "$iface" 2>/dev/null || true
+            ;;
+        *dhcp*)
+            command -v dhclient >/dev/null 2>&1 && dhclient -1 "$iface" 2>/dev/null || true
+            ;;
+        *) : ;;  # manual: link up only
+    esac
+done
+
+# Settle loop: re-assert link-up for ~20s so a post-attach FS toggle that lands
+# after the config pass still ends with the interface UP. Backgrounded so the
+# oneshot returns immediately (sshd isn't delayed); the unit uses KillMode=process
+# so this child survives the oneshot exit.
+[ -n "$managed" ] || exit 0
+(
+    i=0
+    while [ $i -lt 20 ]; do
+        for iface in $managed; do
+            is_up "$iface" || ip link set "$iface" up 2>/dev/null || true
+        done
+        i=$((i+1)); sleep 1
+    done
+) &
+exit 0
+EOF
+        chmod +x "$ROOT/usr/local/sbin/fsh-netcfg.sh"
+        cat > "$ROOT/etc/systemd/system/fsh-netcfg.service" <<'EOF'
+[Unit]
+Description=FSH apply Fabric Studio ifupdown network config (minimal EL)
+After=network-pre.target
+Wants=network-pre.target
+Before=network-online.target sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# KillMode=process: the script backgrounds a ~20s link-up watchdog and returns;
+# don't reap that child when the oneshot's main process exits.
+KillMode=process
+ExecStart=/usr/local/sbin/fsh-netcfg.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        chroot "$ROOT" $CHROOT_SHELL -c "systemctl enable fsh-netcfg.service 2>/dev/null || true"
+        ;;
 esac
 
+# --- fabric payload: bake /fabric (init + setup.d) + a boot-time runner ---
+# FS gives the guest no cloud-init, so first-boot app bring-up rides a systemd
+# oneshot that runs /fabric/init, which executes /fabric/setup.d/* in order.
+# Ordered After=fsh-netcfg/network-online so Docker etc. have networking.
+if [[ -n "$FABRIC_PAYLOAD" ]]; then
+    echo "Baking fabric payload from $FABRIC_PAYLOAD into /fabric ..."
+    mkdir -p "$ROOT/fabric"
+    cp -a "$FABRIC_PAYLOAD/." "$ROOT/fabric/"
+    [[ -f "$ROOT/fabric/init" ]] && chmod +x "$ROOT/fabric/init"
+    [[ -d "$ROOT/fabric/setup.d" ]] && chmod +x "$ROOT"/fabric/setup.d/* 2>/dev/null || true
+    cat > "$ROOT/etc/systemd/system/fabric-init.service" <<'EOF'
+[Unit]
+Description=Fabric first-boot app bring-up (/fabric/init -> setup.d/*)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/fabric/init
+StandardOutput=append:/fabric/logs/setup.log
+StandardError=append:/fabric/logs/setup.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    mkdir -p "$ROOT/fabric/logs"
+    chroot "$ROOT" $CHROOT_SHELL -c "systemctl enable fabric-init.service 2>/dev/null || true"
+fi
+
+# --- provision script: bake packages/config in-chroot at build time ---
+if [[ -n "$PROVISION_SCRIPT" ]]; then
+    echo "Running provision script ($PROVISION_SCRIPT) in chroot ..."
+    cp "$PROVISION_SCRIPT" "$ROOT/tmp/fsh-provision.sh"
+    chmod +x "$ROOT/tmp/fsh-provision.sh"
+    if ! chroot "$ROOT" $CHROOT_SHELL -c "/tmp/fsh-provision.sh"; then
+        echo "❌ Error: provision script failed in chroot"
+        rm -f "$ROOT/tmp/fsh-provision.sh"
+        exit 1
+    fi
+    rm -f "$ROOT/tmp/fsh-provision.sh"
+fi
+
 # --- unmount before packaging ---
+# Remove the persistent dnf cache bind mount BEFORE tarring so cached rpms stay
+# on the host (for reuse) and never bloat the packaged image.
+[[ "$DNF_CACHE_MOUNTED" == "1" ]] && umount -q "$ROOT/var/cache/dnf" || true
 umount -q "$ROOT/dev/pts" || true
 umount -q "$ROOT/dev"     || true
 umount -q "$ROOT/run"     || true
 umount -q "$ROOT/proc"    || true
 umount -q "$ROOT/sys"     || true
 
-echo "[4/6] Creating customized rootfs.tar.xz..."
+echo "[4/6] Creating customized rootfs.tar.xz (parallel xz)..."
 WORK=/work && rm -rf "$WORK" && mkdir -p "$WORK" "$OUTDIR"
-tar -C "$ROOT" -cJf "$WORK/rootfs.tar.xz" --exclude=proc --exclude=sys .
+# -T0: use all cores for xz. Compression of the ~150MB rootfs is the 2nd-biggest
+# build cost and single-threaded xz is especially slow under qemu emulation.
+tar -C "$ROOT" --exclude=proc --exclude=sys -cf - . | xz -T0 -c > "$WORK/rootfs.tar.xz"
 
 echo "[5/6] Preparing packaging files..."
 cat > "$WORK/config" <<EOF

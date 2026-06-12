@@ -42,6 +42,12 @@ OPTIONS:
     --ssh-password PASS     Set SSH password for the user (use .env file for security)
     --ssh-key-file FILE     Add SSH public key from file
     --root-password PASS    Set root password (use .env file for security)
+    --provision-script FILE Run FILE inside the image chroot at BUILD time (bake
+                            in packages/config, e.g. install Docker). Runs after
+                            the standard customization, before packaging.
+    --fabric-payload DIR    Copy DIR into the image rootfs at /fabric (init +
+                            setup.d/) and enable a boot-time fabric-init unit that
+                            runs /fabric/init on first boot.
 
 ENVIRONMENT VARIABLES (.env file):
     Create a .env file (gitignored) with:
@@ -115,6 +121,10 @@ while [[ $# -gt 0 ]]; do
             ZIP_BASENAME="$2"
             shift 2
             ;;
+        --releasever)
+            RELEASEVER="$2"
+            shift 2
+            ;;
         --docker-args)
             EXTRA_DOCKER_ARGS="$2"
             shift 2
@@ -133,6 +143,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --root-password)
             ROOT_PASSWORD="$2"
+            shift 2
+            ;;
+        --provision-script)
+            PROVISION_SCRIPT="$2"
+            shift 2
+            ;;
+        --fabric-payload)
+            FABRIC_PAYLOAD="$2"
             shift 2
             ;;
         --)
@@ -162,6 +180,8 @@ VARIANT="${4:-${VARIANT:-cloud}}"
 : "${SSH_PASSWORD:=${SSH_PASSWORD:-}}"
 : "${SSH_KEY_FILE:=${SSH_KEY_FILE:-}}"
 : "${ROOT_PASSWORD:=${ROOT_PASSWORD:-}}"
+: "${PROVISION_SCRIPT:=${PROVISION_SCRIPT:-}}"
+: "${FABRIC_PAYLOAD:=${FABRIC_PAYLOAD:-}}"
 
 # Validate Docker is available
 if ! command -v docker &> /dev/null; then
@@ -222,9 +242,27 @@ if [[ -n "$SSH_KEY_FILE" ]]; then
     SSH_KEY_FILE="$SSH_KEY_FILE_ABS"
 fi
 
+# Resolve + validate the provision script (run in-chroot at build time)
+if [[ -n "$PROVISION_SCRIPT" ]]; then
+    if [[ ! -f "$PROVISION_SCRIPT" ]]; then
+        echo "❌ Error: provision script '$PROVISION_SCRIPT' not found"
+        exit 1
+    fi
+    PROVISION_SCRIPT="$(cd "$(dirname "$PROVISION_SCRIPT")" && pwd)/$(basename "$PROVISION_SCRIPT")"
+fi
+
+# Resolve + validate the fabric payload dir (copied into the rootfs at /fabric)
+if [[ -n "$FABRIC_PAYLOAD" ]]; then
+    if [[ ! -d "$FABRIC_PAYLOAD" ]]; then
+        echo "❌ Error: fabric payload '$FABRIC_PAYLOAD' is not a directory"
+        exit 1
+    fi
+    FABRIC_PAYLOAD="$(cd "$FABRIC_PAYLOAD" && pwd)"
+fi
+
 # Ensure directories exist
 echo "📁 Creating directories..."
-mkdir -p "$OUTPUT_DIR" "$CACHE_DIR"
+mkdir -p "$OUTPUT_DIR" "$CACHE_DIR" "$CACHE_DIR/dnf"
 
 # Build Docker image if requested
 if [ "$DOCKER_BUILD" = true ]; then
@@ -250,6 +288,12 @@ ENV_ARGS="-e DIST=$DIST -e ARCH=$ARCH -e VARIANT=$VARIANT"
 if [[ -n "$RELEASE" ]]; then
     ENV_ARGS="$ENV_ARGS -e RELEASE=$RELEASE"
 fi
+if [[ -n "${RELEASEVER:-}" ]]; then
+    ENV_ARGS="$ENV_ARGS -e RELEASEVER=$RELEASEVER"
+fi
+if [[ -n "${INSECURE_TLS:-}" ]]; then
+    ENV_ARGS="$ENV_ARGS -e INSECURE_TLS=$INSECURE_TLS"
+fi
 if [[ -n "$ZIP_BASENAME" ]]; then
     ENV_ARGS="$ENV_ARGS -e ZIP_BASENAME=$ZIP_BASENAME"
 fi
@@ -268,13 +312,24 @@ fi
 echo "Debug: SSH_USER=$SSH_USER"
 echo "Debug: SSH_PASSWORD is set: $([[ -n "$SSH_PASSWORD" ]] && echo "YES" || echo "NO")"
 
-# Prepare volume mounts
-VOLUME_ARGS="-v $OUTPUT_DIR:/out -v $CACHE_DIR:/var/cache/lxc"
+# Prepare volume mounts. /dnf-cache persists downloaded rpms across builds
+# (build-lxc.sh bind-mounts it into the chroot's /var/cache/dnf).
+VOLUME_ARGS="-v $OUTPUT_DIR:/out -v $CACHE_DIR:/var/cache/lxc -v $CACHE_DIR/dnf:/dnf-cache"
 
 # Mount SSH key file if specified
 if [[ -n "$SSH_KEY_FILE" ]]; then
     VOLUME_ARGS="$VOLUME_ARGS -v $SSH_KEY_FILE:/ssh_key:ro"
     ENV_ARGS="$ENV_ARGS -e SSH_KEY_FILE=/ssh_key"
+fi
+
+# Mount the provision script + fabric payload (consumed by build-lxc.sh)
+if [[ -n "$PROVISION_SCRIPT" ]]; then
+    VOLUME_ARGS="$VOLUME_ARGS -v $PROVISION_SCRIPT:/provision.sh:ro"
+    ENV_ARGS="$ENV_ARGS -e PROVISION_SCRIPT=/provision.sh"
+fi
+if [[ -n "$FABRIC_PAYLOAD" ]]; then
+    VOLUME_ARGS="$VOLUME_ARGS -v $FABRIC_PAYLOAD:/fabric-payload:ro"
+    ENV_ARGS="$ENV_ARGS -e FABRIC_PAYLOAD=/fabric-payload"
 fi
 
 # Show build information
