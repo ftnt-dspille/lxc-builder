@@ -21,6 +21,7 @@ temp/
 .tmp/
 
 # SSH keys (if storing them in project directory)
+keys/
 *.pub
 *.pem
 id_*

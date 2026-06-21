@@ -169,11 +169,6 @@ done
 : "${SSH_PASSWORD:=}"
 : "${SSH_KEY_FILE:=}"
 : "${ROOT_PASSWORD:=}"
-# Bake-in hooks (wrapper mounts these into the container):
-#   PROVISION_SCRIPT — script run in-chroot at build time (e.g. install Docker)
-#   FABRIC_PAYLOAD   — dir copied into the rootfs at /fabric (init + setup.d/)
-: "${PROVISION_SCRIPT:=}"
-: "${FABRIC_PAYLOAD:=}"
 
 # Set default releases if not specified
 if [[ -z "$RELEASE" ]]; then
@@ -491,15 +486,6 @@ if [[ -n "$SSH_USER" ]]; then
         mkdir -p /home/'$SSH_USER'/.ssh
         chmod 700 /home/'$SSH_USER'/.ssh
         chown '$SSH_USER':'$SSH_USER' /home/'$SSH_USER'/.ssh
-
-        # Passwordless sudo for the admin user. This is a key-only lab toolbox
-        # image with no user password, so wheel/sudo membership alone leaves
-        # sudo unusable non-interactively ('a password is required'). Any
-        # automation that escalates over key SSH (e.g. tools/fs_soar_install.py)
-        # needs NOPASSWD. Drop-in file so it survives package updates.
-        mkdir -p /etc/sudoers.d
-        echo '$SSH_USER ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-'$SSH_USER'-nopasswd
-        chmod 440 /etc/sudoers.d/90-'$SSH_USER'-nopasswd
     "
 
     # Set user password if specified
@@ -696,54 +682,6 @@ EOF
         chroot "$ROOT" $CHROOT_SHELL -c "systemctl enable fsh-netcfg.service 2>/dev/null || true"
         ;;
 esac
-
-# --- fabric payload: bake /fabric (init + setup.d) + a boot-time runner ---
-# FS gives the guest no cloud-init, so first-boot app bring-up rides a systemd
-# oneshot that runs /fabric/init, which executes /fabric/setup.d/* in order.
-# Ordered After=fsh-netcfg/network-online so Docker etc. have networking.
-if [[ -n "$FABRIC_PAYLOAD" ]]; then
-    echo "Baking fabric payload from $FABRIC_PAYLOAD into /fabric ..."
-    mkdir -p "$ROOT/fabric"
-    cp -a "$FABRIC_PAYLOAD/." "$ROOT/fabric/"
-    [[ -f "$ROOT/fabric/init" ]] && chmod +x "$ROOT/fabric/init"
-    [[ -d "$ROOT/fabric/setup.d" ]] && chmod +x "$ROOT"/fabric/setup.d/* 2>/dev/null || true
-    # IMPORTANT: do NOT order on network-online.target — a minimal-EL LXC never
-    # reaches it (no NetworkManager/networkd-wait-online; the IP is raised by the
-    # fsh-netcfg shim), so a unit that Wants/After=network-online.target never
-    # fires. Order after the netcfg shim + docker instead, and don't hard-require
-    # docker (10-docker-up starts it). multi-user.target pulls us in at boot.
-    cat > "$ROOT/etc/systemd/system/fabric-init.service" <<'EOF'
-[Unit]
-Description=Fabric first-boot app bring-up (/fabric/init -> setup.d/*)
-After=fsh-netcfg.service docker.service network.target
-Wants=fsh-netcfg.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/fabric/init
-StandardOutput=append:/fabric/logs/setup.log
-StandardError=append:/fabric/logs/setup.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    mkdir -p "$ROOT/fabric/logs"
-    chroot "$ROOT" $CHROOT_SHELL -c "systemctl enable fabric-init.service 2>/dev/null || true"
-fi
-
-# --- provision script: bake packages/config in-chroot at build time ---
-if [[ -n "$PROVISION_SCRIPT" ]]; then
-    echo "Running provision script ($PROVISION_SCRIPT) in chroot ..."
-    cp "$PROVISION_SCRIPT" "$ROOT/tmp/fsh-provision.sh"
-    chmod +x "$ROOT/tmp/fsh-provision.sh"
-    if ! chroot "$ROOT" $CHROOT_SHELL -c "/tmp/fsh-provision.sh"; then
-        echo "❌ Error: provision script failed in chroot"
-        rm -f "$ROOT/tmp/fsh-provision.sh"
-        exit 1
-    fi
-    rm -f "$ROOT/tmp/fsh-provision.sh"
-fi
 
 # --- unmount before packaging ---
 # Remove the persistent dnf cache bind mount BEFORE tarring so cached rpms stay
