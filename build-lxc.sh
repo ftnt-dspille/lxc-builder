@@ -448,10 +448,13 @@ EOF
     esac
 fi
 
-# Install packages based on distribution
-echo "Installing packages: $PACKAGES"
+# Install packages based on distribution. EXTRA_PACKAGES (env, space-separated)
+# appends distro packages on top of the preset — e.g. EXTRA_PACKAGES=python3.12
+# to bake a specific interpreter into the image. Pass it through the wrapper with
+# `--docker-args "-e EXTRA_PACKAGES=python3.12"`.
+echo "Installing packages: $PACKAGES ${EXTRA_PACKAGES:-}"
 chroot "$ROOT" $CHROOT_SHELL -c "
-    $PKG_UPDATE && $PKG_INSTALL $PACKAGES
+    $PKG_UPDATE && $PKG_INSTALL $PACKAGES ${EXTRA_PACKAGES:-}
 "
 
 # Enable SSH service if needed
