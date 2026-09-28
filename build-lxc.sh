@@ -169,6 +169,11 @@ done
 : "${SSH_PASSWORD:=}"
 : "${SSH_KEY_FILE:=}"
 : "${ROOT_PASSWORD:=}"
+# Bake-in hooks (wrapper mounts these into the container):
+#   PROVISION_SCRIPT -- script run in-chroot at build time (e.g. install Docker)
+#   FABRIC_PAYLOAD   -- dir copied into the rootfs at /fabric (init + setup.d/)
+: "${PROVISION_SCRIPT:=}"
+: "${FABRIC_PAYLOAD:=}"
 
 # Set default releases if not specified
 if [[ -z "$RELEASE" ]]; then
@@ -378,7 +383,7 @@ if [[ -n "$RELEASEVER" ]]; then
         rockylinux)
             # Only the CURRENT minor is on the live mirror network; archived
             # minors (and reliably ALL minors) live in the vault. Disable the
-            # stock mirrorlist repos and write a clean vault-pinned repo file —
+            # stock mirrorlist repos and write a clean vault-pinned repo file --
             # robust whether $RELEASEVER is current or archived. (Writing the
             # file from the host side avoids chroot double-shell $var expansion.)
             echo "Pinning rockylinux to $RELEASEVER via vault repos + distro-sync..."
@@ -449,7 +454,7 @@ EOF
 fi
 
 # Install packages based on distribution. EXTRA_PACKAGES (env, space-separated)
-# appends distro packages on top of the preset — e.g. EXTRA_PACKAGES=python3.12
+# appends distro packages on top of the preset -- e.g. EXTRA_PACKAGES=python3.12
 # to bake a specific interpreter into the image. Pass it through the wrapper with
 # `--docker-args "-e EXTRA_PACKAGES=python3.12"`.
 echo "Installing packages: $PACKAGES ${EXTRA_PACKAGES:-}"
@@ -489,6 +494,15 @@ if [[ -n "$SSH_USER" ]]; then
         mkdir -p /home/'$SSH_USER'/.ssh
         chmod 700 /home/'$SSH_USER'/.ssh
         chown '$SSH_USER':'$SSH_USER' /home/'$SSH_USER'/.ssh
+
+        # Passwordless sudo for the admin user. This is a key-only lab toolbox
+        # image with no user password, so wheel/sudo membership alone leaves
+        # sudo unusable non-interactively ('a password is required'). Any
+        # automation that escalates over key SSH (e.g. tools/fs_soar_install.py)
+        # needs NOPASSWD. Drop-in file so it survives package updates.
+        mkdir -p /etc/sudoers.d
+        echo '$SSH_USER ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-'$SSH_USER'-nopasswd
+        chmod 440 /etc/sudoers.d/90-'$SSH_USER'-nopasswd
     "
 
     # Set user password if specified
@@ -551,7 +565,7 @@ case "$DIST" in
         ;;
     centos|rockylinux|almalinux|fedora)
         # EL minimal LXC networking. ROOT CAUSE (confirmed live, 2026-06-09):
-        # Fabric Studio does NOT serve DHCP for a port — it auto-assigns a STATIC
+        # Fabric Studio does NOT serve DHCP for a port -- it auto-assigns a STATIC
         # address in its model and injects it into the guest by writing Debian
         # ifupdown config straight into the rootfs: /etc/network/interfaces +
         # /etc/network/interfaces.d/ethN.conf with `iface ethN inet static /
@@ -562,7 +576,7 @@ case "$DIST" in
         # injected config is ignored and eth0 never gets an address.
         #
         # Fix: a tiny oneshot that parses FS's interfaces.d/*.conf and applies it
-        # via iproute2 — no package deps, works on minimal EL. NM stays disabled
+        # via iproute2 -- no package deps, works on minimal EL. NM stays disabled
         # so it can't fight the shim; the stale dhcp ifcfg-eth0 is removed.
         echo "Configuring EL networking (FS ifupdown-config shim)..."
         chroot "$ROOT" $CHROOT_SHELL -c "
@@ -577,16 +591,16 @@ case "$DIST" in
 # `iface ethN inet {static|manual|dhcp}` with address/netmask (+optional gateway).
 #
 # WHY A SCRIPT, NOT A NATIVE CONSUMER: FS writes Debian ifupdown-format files.
-# EL ships nothing that reads /etc/network/interfaces.d — no ifupdown package, no
+# EL ships nothing that reads /etc/network/interfaces.d -- no ifupdown package, no
 # NM-ifupdown plugin (NM has only ifcfg-rh/keyfile), and network-scripts reads
 # ifcfg, not interfaces.d. The known-good debian-trixie toolbox consumes them via
 # ifupdown's `networking.service` (`ifup -a`) at boot. NOTE: udev does NOT run in
-# these LXC containers (systemd-udevd inactive, no /run/udev — host owns devices),
+# these LXC containers (systemd-udevd inactive, no /run/udev -- host owns devices),
 # so trixie's 80-ifupdown.rules never fires; its eth0 is raised by boot-time
 # `ifup -a`. So this is a boot-time oneshot too.
 #
 # RACE (confirmed live 2026-06-09): a single early `ip link set up` does NOT stick
-# — FS attaches the container veth around boot and the port ends admin-DOWN *after*
+# -- FS attaches the container veth around boot and the port ends admin-DOWN *after*
 # the oneshot exits, even though the address we add persists. Once eth0 is genuinely
 # UP nothing re-lowers it. trixie escapes this because networking.service is ordered
 # late (After local-fs/modules-load/ifupdown-pre) so the veth has settled. We can't
@@ -685,6 +699,66 @@ EOF
         chroot "$ROOT" $CHROOT_SHELL -c "systemctl enable fsh-netcfg.service 2>/dev/null || true"
         ;;
 esac
+
+# --- fabric payload: bake /fabric (init + setup.d) + a boot-time runner ---
+# FS gives the guest no cloud-init, so first-boot app bring-up rides a systemd
+# oneshot that runs /fabric/init, which executes /fabric/setup.d/* in order.
+# Ordered After=fsh-netcfg/network-online so Docker etc. have networking.
+if [[ -n "$FABRIC_PAYLOAD" ]]; then
+    echo "Baking fabric payload from $FABRIC_PAYLOAD into /fabric ..."
+    mkdir -p "$ROOT/fabric"
+    cp -a "$FABRIC_PAYLOAD/." "$ROOT/fabric/"
+    [[ -f "$ROOT/fabric/init" ]] && chmod +x "$ROOT/fabric/init"
+    [[ -d "$ROOT/fabric/setup.d" ]] && chmod +x "$ROOT"/fabric/setup.d/* 2>/dev/null || true
+    # IMPORTANT: do NOT order on network-online.target -- a minimal-EL LXC never
+    # reaches it (no NetworkManager/networkd-wait-online; the IP is raised by the
+    # fsh-netcfg shim), so a unit that Wants/After=network-online.target never
+    # fires. Order after the netcfg shim + docker instead, and don't hard-require
+    # docker (10-docker-up starts it). multi-user.target pulls us in at boot.
+    cat > "$ROOT/etc/systemd/system/fabric-init.service" <<'EOF'
+[Unit]
+Description=Fabric first-boot app bring-up (/fabric/init -> setup.d/*)
+After=fsh-netcfg.service docker.service network.target
+Wants=fsh-netcfg.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/fabric/init
+StandardOutput=append:/fabric/logs/setup.log
+StandardError=append:/fabric/logs/setup.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    mkdir -p "$ROOT/fabric/logs"
+    chroot "$ROOT" $CHROOT_SHELL -c "systemctl enable fabric-init.service 2>/dev/null || true"
+fi
+
+# --- provision script: bake packages/config in-chroot at build time ---
+if [[ -n "$PROVISION_SCRIPT" ]]; then
+    echo "Running provision script ($PROVISION_SCRIPT) in chroot ..."
+    cp "$PROVISION_SCRIPT" "$ROOT/tmp/fsh-provision.sh"
+    chmod +x "$ROOT/tmp/fsh-provision.sh"
+    if ! chroot "$ROOT" $CHROOT_SHELL -c "/tmp/fsh-provision.sh"; then
+        echo "❌ Error: provision script failed in chroot"
+        rm -f "$ROOT/tmp/fsh-provision.sh"
+        exit 1
+    fi
+    rm -f "$ROOT/tmp/fsh-provision.sh"
+fi
+
+# --- bake pre-built agent image (optional) ---
+# If a docker image tar exists next to the provision script, copy it into
+# /fabric/agent-images/ so it survives config-backup/restore and is available
+# at provision time without needing online access to the yum server.
+AGENT_TAR="${AGENT_TAR:-${PROVISION_SCRIPT%/*}/agent_765.tar}"
+if [[ -f "$AGENT_TAR" ]]; then
+    echo "Baking agent image tar into /opt/agent-images/ ..."
+    mkdir -p "$ROOT/opt/agent-images"
+    cp "$AGENT_TAR" "$ROOT/opt/agent-images/agent_765.tar"
+    echo "  baked $(du -h "$AGENT_TAR" | cut -f1) agent image"
+fi
 
 # --- unmount before packaging ---
 # Remove the persistent dnf cache bind mount BEFORE tarring so cached rpms stay

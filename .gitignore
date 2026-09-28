@@ -9,6 +9,7 @@
 # Build outputs
 out/
 *.zip
+*.tar
 
 # Cache directories
 lxc-cache/
